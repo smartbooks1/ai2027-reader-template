@@ -9,11 +9,31 @@ const displayName=path=>decodeURIComponent(path.split('/').pop()).replace(/\.pdf
 const link=path=>path.split('/').map(encodeURIComponent).join('/');
 let books=[],readerDefaults={fit:'auto'},currentPage=1,totalPages=0,currentBookIndex=-1,currentBookUrl='',pageInfoTask=null,pdfDocument=null,openToken=0,zoomLevel=100,fitMode='page',twoPage=false,spreadRenderToken=0,spreadRenderTasks=[];
 const BOOKMARK_KEY='reader:'+ROOT+':manual-bookmark:v1';
-const TOC_HINT_KEY='reader:'+ROOT+':toc-hint-seen:v1';
 // Canvas spreads need supersampling to retain the sharp text of the native PDF viewer.
 const MIN_SPREAD_RENDER_RATIO=2;
 const MAX_SPREAD_RENDER_RATIO=3;
 const MAX_SPREAD_PAGE_PIXELS=12000000;
+let coverImagePromise=null;
+async function drawBlankCover(canvas,width,height,ratio,mirrored=false){
+ if(!coverImagePromise){
+  // Re-fetch on each visit; reuse the decoded image only within this reader session.
+  coverImagePromise=(async()=>{
+   const artwork=document.querySelector('[data-reader-artwork]');if(!artwork)return null;
+   const response=await fetch(artwork.src,{cache:'no-store'});
+   if(!response.ok)throw Error('Cover image request failed ('+response.status+')');
+   const objectUrl=URL.createObjectURL(await response.blob());
+   try{const image=new Image();image.src=objectUrl;await image.decode();return image}
+   finally{URL.revokeObjectURL(objectUrl)}
+  })().catch(()=>{coverImagePromise=null;return null});
+ }
+ const image=await coverImagePromise;if(!image)return;
+ // Match the CSS mobile breakpoint: 30 mm wide on mobile, 40 mm on PC (96 CSS pixels per inch).
+ const imageWidthMm=window.matchMedia('(max-width:760px),(max-width:1000px) and (pointer:coarse)').matches?30:40;
+ const imageWidth=imageWidthMm*96/25.4,imageHeight=imageWidth*image.naturalHeight/image.naturalWidth;
+ const context=canvas.getContext('2d');context.save();context.scale(ratio,ratio);
+ if(mirrored){context.translate(width,0);context.scale(-1,1)}
+ context.drawImage(image,(width-imageWidth)/2,(height-imageHeight)/2,imageWidth,imageHeight);context.restore();
+}
 const info=(text,error=false)=>{$('message').textContent=text;$('message').className='message'+(error?' error':'');$('message').hidden=false};
 async function discover(){
  const resp=await fetch('https://api.github.com/repos/'+ROOT+'/git/trees/main?recursive=1',{headers:{Accept:'application/vnd.github+json'},cache:'no-store'});
@@ -78,12 +98,13 @@ async function loadBooks(){
   const siteTitle=typeof config.siteTitle==='string'&&config.siteTitle.trim()?config.siteTitle:'전자책 자료실';
   $('siteTitle').textContent=siteTitle;document.title=siteTitle;
   if(!books.length){$('chapters').replaceChildren();info('표시할 PDF가 없습니다. config/books.json의 books, visible, autoDiscover 설정을 확인해 주세요.');return}
-  const nav=$('chapters'),mobileList=$('mobileTocList');nav.replaceChildren();mobileList.replaceChildren();$('mobileTocCount').textContent=books.length+'개';$('mobileTocBadge').textContent=String(books.length);
+  const nav=$('chapters'),mobileList=$('mobileTocList');nav.replaceChildren();mobileList.replaceChildren();$('welcomeResources').replaceChildren();$('mobileTocCount').textContent=books.length+'개';$('mobileTocBadge').textContent=String(books.length);
   books.forEach((b,i)=>{
    const btn=document.createElement('button');btn.className='chapter';btn.textContent=b.title;btn.onclick=()=>openBook(i);nav.appendChild(btn);
-   const option=document.createElement('button'),number=document.createElement('span'),label=document.createElement('span');option.type='button';option.className='mobile-toc-option';option.setAttribute('role','option');option.setAttribute('aria-selected','false');number.className='mobile-toc-number';number.textContent=String(i+1).padStart(2,'0');label.className='mobile-toc-title';label.textContent=b.title;option.append(number,label);option.onclick=()=>{setMobileTocOpen(false);openBook(i)};mobileList.appendChild(option);
+   const resource=document.createElement('button'),resourceTitle=document.createElement('span'),arrow=document.createElement('span');resource.type='button';resource.className='welcome-resource';resourceTitle.textContent=b.title;arrow.textContent='\u2192';arrow.setAttribute('aria-hidden','true');resource.append(resourceTitle,arrow);resource.onclick=()=>openBook(i);$('welcomeResources').appendChild(resource);
+   const option=document.createElement('button'),label=document.createElement('span');option.type='button';option.className='mobile-toc-option';option.setAttribute('role','option');option.setAttribute('aria-selected','false');label.className='mobile-toc-title';label.textContent=b.title;option.append(label);option.onclick=()=>{setMobileTocOpen(false);openBook(i)};mobileList.appendChild(option);
   });
-  $('message').hidden=true;showMobileTocHint();
+  $('message').hidden=true;
  }catch(e){info('도서 목록을 불러오지 못했습니다: '+e.message,true)}
 }
 
@@ -101,6 +122,7 @@ function updatePageControls(){
  $('singlePageMode').setAttribute('aria-pressed',String(!twoPage));$('twoPageMode').setAttribute('aria-pressed',String(twoPage));
  $('mobileSinglePageMode').setAttribute('aria-pressed',String(!twoPage));$('mobileTwoPageMode').setAttribute('aria-pressed',String(twoPage));
  updateBookmarkButtons();
+ $('downloadOriginal').disabled=!currentBookUrl||!totalPages||downloadInProgress;
 }
 function readBookmark(){
  try{const value=JSON.parse(localStorage.getItem(BOOKMARK_KEY));return value&&typeof value.file==='string'&&Number.isInteger(value.page)&&value.page>0?value:null}catch{return null}
@@ -112,9 +134,42 @@ function bookmarkTarget(){
 function updateBookmarkButtons(){
  const target=bookmarkTarget(),exists=!!target,ready=!!(pdfDocument&&totalPages&&currentBookIndex>=0);
  $('bookmarkSave').disabled=!ready;$('bookmarkGo').hidden=!exists;$('bookmarkDelete').hidden=!exists;
- const here=!!(target&&target.index===currentBookIndex&&target.page===currentPage),saveLabel=here?'책갈피 저장됨':'책갈피 설정';
+ const here=!!(target&&target.index===currentBookIndex&&target.page===currentPage),saveLabel=here?'책갈피 저장됨':'책갈피';
  $('bookmarkSave').setAttribute('aria-pressed',String(here));$('bookmarkSave').setAttribute('aria-label',here?'현재 페이지에 책갈피가 설정됨':'현재 페이지에 책갈피 설정');$('bookmarkSave').title=saveLabel;$('bookmarkSave').querySelector('span').textContent=saveLabel;
  if(target){$('bookmarkGo').title=target.title+' '+target.page+'쪽으로 이동';$('bookmarkGo').setAttribute('aria-label',$('bookmarkGo').title)}
+}
+let downloadInProgress=false;
+async function downloadOriginal(){
+ if(downloadInProgress||!currentBookUrl||!totalPages)return;
+ const url=currentBookUrl,filename=decodeURIComponent(new URL(url).pathname.split('/').pop())||'original.pdf';
+ const button=$('downloadOriginal');
+ downloadInProgress=true;button.disabled=true;button.setAttribute('aria-busy','true');
+ let writable=null;
+ try{
+  if(typeof window.showSaveFilePicker==='function'&&window.isSecureContext){
+   // Open the picker before awaiting any data so the click's user activation is retained.
+   let handle;
+   try{handle=await window.showSaveFilePicker({suggestedName:filename,types:[{description:'PDF 문서',accept:{'application/pdf':['.pdf']}}]})}
+   catch(error){
+    if(error.name==='AbortError')return;
+    if(error.name!=='SecurityError'&&error.name!=='NotAllowedError')throw error;
+   }
+   if(handle){
+    const response=await fetch(url);
+    if(!response.ok)throw Error('파일 요청 실패 ('+response.status+')');
+    const blob=await response.blob();
+    writable=await handle.createWritable();await writable.write(blob);await writable.close();writable=null;
+    return;
+   }
+  }
+  const anchor=document.createElement('a');anchor.href=url;anchor.download=filename;
+  document.body.appendChild(anchor);anchor.click();anchor.remove();
+ }catch(error){
+  if(writable){try{await writable.abort()}catch{}}
+  if(error.name!=='AbortError')info('원본 PDF를 내려받지 못했습니다: '+error.message,true);
+ }finally{
+  downloadInProgress=false;button.removeAttribute('aria-busy');button.disabled=!currentBookUrl||!totalPages;
+ }
 }
 function saveBookmark(){
  if(!pdfDocument||currentBookIndex<0||!totalPages)return;
@@ -143,40 +198,21 @@ function visiblePages(){
  if(currentPage===1)return [null,1];
  return [currentPage,currentPage+1<=totalPages?currentPage+1:null];
 }
+let cancelPageTurn=null;
 function cancelSpreadRendering(){
+ cancelPageTurn?.();
  spreadRenderToken++;for(const task of spreadRenderTasks){try{task.cancel()}catch{}}spreadRenderTasks=[];
 }
 function spreadRenderRatio(width,height){
  const screenRatio=Math.max(MIN_SPREAD_RENDER_RATIO,Math.min(window.devicePixelRatio||1,MAX_SPREAD_RENDER_RATIO));
  return Math.min(screenRatio,Math.sqrt(MAX_SPREAD_PAGE_PIXELS/(width*height)));
 }
-// Bounded LRU cache of rendered canvas pages. Entries are isolated per opened PDF.
-const pageCanvasCache=new Map();
-const MAX_CACHE_PIXELS=24000000;
-let pageCachePixels=0,cacheDocument=null;
-function resetCanvasCache(documentRef){
- if(cacheDocument!==documentRef){pageCanvasCache.clear();pageCachePixels=0;cacheDocument=documentRef}
-}
-function cachedCanvas(key){
- const value=pageCanvasCache.get(key);
- if(value){pageCanvasCache.delete(key);pageCanvasCache.set(key,value)}
- return value;
-}
-function keepCanvas(key,canvas){
- const pixels=canvas.width*canvas.height;
- if(pixels>MAX_CACHE_PIXELS/2)return;
- const old=pageCanvasCache.get(key);
- if(old){pageCachePixels-=old.width*old.height;pageCanvasCache.delete(key)}
- pageCanvasCache.set(key,canvas);pageCachePixels+=pixels;
- while(pageCachePixels>MAX_CACHE_PIXELS&&pageCanvasCache.size>1){
-  const first=pageCanvasCache.keys().next().value,removed=pageCanvasCache.get(first);
-  pageCachePixels-=removed.width*removed.height;pageCanvasCache.delete(first);
- }
-}
+let pageTurnBusy=false;
 function renderNativePages(direction=0){
  cancelSpreadRendering();const token=spreadRenderToken,pages=$('nativePages');
- const animateTurn=direction&&twoPage&&!smallScreen()&&!window.matchMedia('(prefers-reduced-motion:reduce)').matches;
+ const animateTurn=direction&&!smallScreen()&&!window.matchMedia('(prefers-reduced-motion:reduce)').matches;
  const previous=animateTurn?pages.querySelector('.spread-stage:not([hidden])'):null;
+ pageTurnBusy=!!previous;
  if(previous)pages.replaceChildren(previous);else pages.replaceChildren();
  pages.classList.toggle('two-page',twoPage);
  pages.classList.toggle('page-fitted',fitMode==='page'&&zoomLevel===100);
@@ -185,56 +221,117 @@ function renderNativePages(direction=0){
 }
 async function renderPageView(container,token,direction=0){
  const documentRef=pdfDocument,slots=visiblePages();
- resetCanvasCache(documentRef);
  try{
   await new Promise(resolve=>requestAnimationFrame(resolve));
   const loaded=await Promise.all(slots.map(pageNumber=>pageNumber===null?null:documentRef.getPage(pageNumber)));
    if(token!==spreadRenderToken||documentRef!==pdfDocument)return;
   const real=loaded.filter(Boolean),base=real.map(page=>page.getViewport({scale:1}));
   const maxWidth=Math.max(...base.map(view=>view.width)),maxHeight=Math.max(...base.map(view=>view.height));
-   const padding=fitMode==='page'?10:Math.min(28,Math.max(12,container.clientWidth*.02)),gap=twoPage?3:0,slotCount=twoPage?2:1;
+   const padding=fitMode==='page'?10:Math.min(28,Math.max(12,container.clientWidth*.02)),gap=0,slotCount=twoPage?2:1;
    const widthScale=Math.max(.1,(container.clientWidth-padding*2-gap*(slotCount-1))/(maxWidth*slotCount));
   const heightScale=Math.max(.1,(container.clientHeight-padding*2)/maxHeight);
   const fitScale=fitMode==='width'?widthScale:Math.min(widthScale,heightScale);
   const scale=fitScale*(zoomLevel/100);
   const reference=real[0].getViewport({scale}),referenceWidth=Math.max(1,Math.round(reference.width)),referenceHeight=Math.max(1,Math.round(reference.height));
   const stage=document.createElement('div');stage.className='spread-stage';stage.style.setProperty('--spread-padding',padding+'px');
-  const renderItems=[];
+  const renderItems=[],blankRenders=[];
   loaded.forEach((page,index)=>{
    const sideClass=twoPage?(index===0?'spread-left':'spread-right'):'spread-single';
-   if(!page){const blank=document.createElement('div');blank.className='spread-blank '+sideClass;blank.setAttribute('aria-label','빈 페이지');blank.style.width=referenceWidth+'px';blank.style.height=referenceHeight+'px';stage.appendChild(blank);return}
+   if(!page){
+    const blank=document.createElement('canvas'),ratio=spreadRenderRatio(referenceWidth,referenceHeight);
+    blank.className='spread-blank '+sideClass;blank.setAttribute('aria-label','빈 페이지');
+    blank.width=Math.ceil(referenceWidth*ratio);blank.height=Math.ceil(referenceHeight*ratio);
+    blank.style.width=referenceWidth+'px';blank.style.height=referenceHeight+'px';
+    const context=blank.getContext('2d');context.fillStyle='#fff';context.fillRect(0,0,blank.width,blank.height);
+    if((index===0&&slots[1]===1)||(index===1&&slots[0]===totalPages)){
+     blank.setAttribute('aria-label','표지 이미지');
+     blankRenders.push(drawBlankCover(blank,referenceWidth,referenceHeight,ratio,index===0));
+    }
+    stage.appendChild(blank);return;
+   }
    const display=page.getViewport({scale}),displayWidth=Math.max(1,Math.round(display.width)),displayHeight=Math.max(1,Math.round(display.height));
    const outputScale=spreadRenderRatio(displayWidth,displayHeight);
-   const canvas=document.createElement('canvas');canvas.className='spread-page '+sideClass;canvas.width=Math.ceil(displayWidth*outputScale);canvas.height=Math.ceil(displayHeight*outputScale);canvas.style.width=displayWidth+'px';canvas.style.height=displayHeight+'px';canvas.setAttribute('aria-label',slots[index]+'쪽');stage.appendChild(canvas);
-   const cacheKey=[slots[index],canvas.width,canvas.height,display.rotation].join(':');
-   const stored=cachedCanvas(cacheKey);
-   if(stored){canvas.getContext('2d',{alpha:false}).drawImage(stored,0,0)}
-   else renderItems.push({page,canvas,display,outputScale,cacheKey});
+   const canvas=document.createElement('canvas');canvas.className='spread-page '+sideClass;canvas.width=Math.ceil(displayWidth*outputScale);canvas.height=Math.ceil(displayHeight*outputScale);canvas.style.width=displayWidth+'px';canvas.style.height=displayHeight+'px';canvas.setAttribute('aria-label',slots[index]+'쪽');stage.appendChild(canvas);renderItems.push({page,canvas,display,outputScale});
   });
   // Keep the finished spread visible while the next canvases render off screen.
-  stage.hidden=!!direction;container.appendChild(stage);
+  stage.hidden=!!direction;
+  if(direction){stage.classList.add('spread-pending');stage.style.visibility='hidden'}
+  container.appendChild(stage);
   spreadRenderTasks=renderItems.map(item=>item.page.render({canvasContext:item.canvas.getContext('2d',{alpha:false}),viewport:item.display,transform:[item.outputScale,0,0,item.outputScale,0,0],background:'#fff'}));
-  await Promise.all(spreadRenderTasks.map(task=>task.promise));
+  await Promise.all([...spreadRenderTasks.map(task=>task.promise),...blankRenders]);
   if(token!==spreadRenderToken||documentRef!==pdfDocument)return;
-  for(const item of renderItems)keepCanvas(item.cacheKey,item.canvas);
   spreadRenderTasks=[];
   if(direction){
-   stage.hidden=false;container.replaceChildren(stage);
-   animateSpreadTurn(stage,direction);
+   const previous=container.querySelector('.spread-stage:not([hidden])');
+   stage.hidden=false;
+   await animateSpreadTurn(container,previous,stage,direction);
+   if(token===spreadRenderToken){stage.style.visibility='';stage.classList.remove('spread-pending');container.replaceChildren(stage)}
   }
  }catch(error){if(error?.name!=='RenderingCancelledException'&&token===spreadRenderToken)info('두 쪽 보기를 표시하지 못했습니다: '+error.message,true)}
+ finally{if(token===spreadRenderToken)pageTurnBusy=false}
 }
-function animateSpreadTurn(stage,direction){
- // Animate existing canvases around the binding; no copies or extra PDF renders.
- const turning=stage.querySelector(direction>0?'.spread-left':'.spread-right');
- const opposite=stage.querySelector(direction>0?'.spread-right':'.spread-left');
- if(!turning)return;
- const origin=direction>0?'100% 50%':'0% 50%',angle=direction>0?72:-72;
- turning.animate([
-  {transform:'perspective(1600px) rotateY('+angle+'deg)',transformOrigin:origin,opacity:.4},
-  {transform:'perspective(1600px) rotateY(0deg)',transformOrigin:origin,opacity:1}
- ],{duration:280,easing:'cubic-bezier(.2,.65,.3,1)'});
- opposite?.animate([{opacity:.6},{opacity:1}],{duration:200,easing:'ease-out'});
+async function animateSpreadTurn(container,previous,stage,direction){
+ if(!previous||!window.St?.PageFlip)return;
+ const spread=twoPage,oldPages=[...previous.children],newPages=[...stage.children];
+ // Portrait flipPrev slides its back face. Mirror the same curl used by flipNext instead.
+ const mirrored=!spread&&direction<0,turnDirection=mirrored?1:direction;
+ const first=oldPages[0],rect=first.getBoundingClientRect(),surface=container.getBoundingClientRect();
+ const host=document.createElement('div');host.className='book-turn-layer';host.setAttribute('aria-hidden','true');
+ // Do not show a second static copy before the actual paper movement starts.
+ host.style.visibility='hidden';
+ host.style.left=(rect.left-surface.left+container.scrollLeft)+'px';host.style.top=(rect.top-surface.top+container.scrollTop)+'px';
+ host.style.width=(rect.width*(spread?2:1))+'px';host.style.height=rect.height+'px';
+ if(mirrored)host.style.transform='scaleX(-1) translateZ(0)';
+ const images=[];
+ const ordered=turnDirection>0?[...oldPages,...newPages]:[...newPages,...oldPages];
+ const leaves=ordered.map(source=>{
+  const leaf=document.createElement('div');leaf.className='book-turn-leaf';leaf.dataset.density='soft';
+  if(source instanceof HTMLCanvasElement){
+   // The engine clones portrait leaves; images retain their pixels when cloned, canvases do not.
+   const image=document.createElement('img');image.alt='';image.src=source.toDataURL('image/png');
+   if(mirrored)image.style.transform='scaleX(-1)';
+   images.push(image);leaf.appendChild(image);
+  }
+  host.appendChild(leaf);return leaf;
+ });
+ await Promise.all(images.map(image=>image.decode()));
+ if(!previous.isConnected||!stage.isConnected)return;
+ container.appendChild(host);
+ let flip,timer,finish,started=false;
+ try{
+  await new Promise((resolve,reject)=>{
+   let done=false;
+   finish=()=>{if(done)return;done=true;clearTimeout(timer);resolve()};
+   cancelPageTurn=finish;
+   timer=setTimeout(finish,2200);
+   try{
+    flip=new window.St.PageFlip(host,{
+     width:rect.width,height:rect.height,size:'fixed',autoSize:false,
+     usePortrait:!spread,startPage:turnDirection>0?0:(spread?2:1),showCover:false,
+     drawShadow:true,maxShadowOpacity:.35,flippingTime:650,
+     // Input is handled by our reader; corner checks would block portrait flipPrev().
+     useMouseEvents:false,showPageCorners:false,disableFlipByClick:false,
+     mobileScrollSupport:false
+    });
+    flip.on('changeState',event=>{if(event.data==='flipping')started=true;else if(started&&event.data==='read')finish()});
+    flip.on('init',()=>{
+     if(done)return;
+     stage.style.visibility='hidden';
+     // Keep the original spread underneath until the overlay has painted.
+     requestAnimationFrame(()=>requestAnimationFrame(()=>{
+      if(done)return;
+      if(turnDirection>0)flip.flipNext('bottom');else flip.flipPrev('bottom');
+      host.style.visibility='';
+     }));
+    });
+    flip.loadFromHTML(leaves);
+   }catch(error){clearTimeout(timer);reject(error)}
+  });
+ }finally{
+  if(cancelPageTurn===finish)cancelPageTurn=null;
+  clearTimeout(timer);flip?.destroy();host.remove();
+  previous.style.visibility='';stage.style.visibility='';
+ }
 }
 function goToPage(pageNumber){
  if(!totalPages)return;
@@ -276,7 +373,7 @@ async function openBook(index,options={}){
  document.querySelectorAll('.chapter').forEach((button,i)=>{button.classList.toggle('active',i===index);button.setAttribute('aria-current',i===index?'true':'false')});
  document.querySelectorAll('.mobile-toc-option').forEach((button,i)=>{const active=i===index;button.classList.toggle('active',active);button.setAttribute('aria-selected',String(active))});
  setMobileTocOpen(false);
- $('welcome').hidden=true;$('viewer').classList.remove('is-welcome');
+ document.querySelector('.main').classList.remove('is-home');$('welcome').hidden=true;$('viewer').classList.remove('is-welcome');
  $('sidebar').classList.remove('open');syncMenu();
  currentBookIndex=index;currentBookUrl=url.href;currentPage=1;totalPages=0;zoomLevel=100;updatePageControls();
  // The native toolbar is replaced by the simpler site-owned page bar.
@@ -317,6 +414,7 @@ $('mobileFitPage').onclick=()=>setFitMode('page');
 $('mobileSinglePageMode').onclick=()=>setTwoPage(false);
 $('mobileTwoPageMode').onclick=()=>setTwoPage(true);
 $('bookmarkSave').onclick=saveBookmark;
+$('downloadOriginal').onclick=downloadOriginal;
 $('bookmarkGo').onclick=goToBookmark;
 $('bookmarkDelete').onclick=deleteBookmark;
 const smallScreen=()=>window.matchMedia('(max-width:760px), (max-width:1000px) and (pointer:coarse)').matches;
@@ -330,11 +428,6 @@ let resizeTimer=null;
 function scheduleSpreadRender(){clearTimeout(resizeTimer);if(pdfDocument)resizeTimer=setTimeout(renderNativePages,120)}
 $('menu').onclick=()=>{if(smallScreen())$('sidebar').classList.toggle('open');else document.querySelector('.layout').classList.toggle('sidebar-collapsed');syncMenu();scheduleSpreadRender()};
 function setMobileToolsOpen(open){$('readerPagebar').classList.toggle('more-open',open);$('mobileMore').setAttribute('aria-expanded',String(open))}
-function showMobileTocHint(){
- if(!smallScreen())return;
- try{if(sessionStorage.getItem(TOC_HINT_KEY))return;sessionStorage.setItem(TOC_HINT_KEY,'1')}catch{}
- const toc=document.querySelector('.mobile-toc');toc.classList.add('attention');setTimeout(()=>toc.classList.remove('attention'),4500);
-}
 function setMobileTocOpen(open){const toc=document.querySelector('.mobile-toc');toc.classList.remove('attention');$('mobileTocMenu').hidden=!open;$('mobileTocButton').setAttribute('aria-expanded',String(open));toc.classList.toggle('open',open)}
 $('mobileTocButton').onclick=event=>{event.stopPropagation();const open=$('mobileTocMenu').hidden;setMobileToolsOpen(false);setMobileTocOpen(open)};
 $('mobileMore').onclick=event=>{event.stopPropagation();setMobileTocOpen(false);setMobileToolsOpen(!$('readerPagebar').classList.contains('more-open'))};
@@ -350,7 +443,22 @@ document.addEventListener('keydown',event=>{
  if(event.key==='ArrowRight')goToPage(nextPage());
 });
 const pageSurface=$('nativePages');
-let swipeStart=null,pinchState=null;
+let swipeStart=null,pinchState=null,mouseStart=null;
+pageSurface.addEventListener('pointerdown',event=>{
+ mouseStart=null;
+ if(smallScreen()||event.pointerType!=='mouse'||event.button!==0||zoomLevel!==100||pageTurnBusy)return;
+ const page=event.target.closest('.spread-page,.spread-blank');
+ if(page)mouseStart={page,x:event.clientX,y:event.clientY,id:event.pointerId};
+});
+pageSurface.addEventListener('pointerup',event=>{
+ const start=mouseStart;mouseStart=null;
+ if(!start||start.id!==event.pointerId||smallScreen()||pageTurnBusy||zoomLevel!==100||event.button!==0)return;
+ if(Math.hypot(event.clientX-start.x,event.clientY-start.y)>6||!start.page.contains(event.target))return;
+ const rect=start.page.getBoundingClientRect();
+ const backwards=twoPage?start.page.classList.contains('spread-left'):(event.clientX-rect.left)/rect.width<.5;
+ goToPage(backwards?previousPage():nextPage());
+});
+pageSurface.addEventListener('pointercancel',()=>{mouseStart=null});
 const touchDistance=touches=>Math.hypot(touches[0].clientX-touches[1].clientX,touches[0].clientY-touches[1].clientY);
 pageSurface.addEventListener('touchstart',event=>{
  if(!smallScreen())return;

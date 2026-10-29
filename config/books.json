@@ -3,8 +3,7 @@
   "autoDiscover": true,
   "readerDefaults": {
     "fit": "auto",
-    "twoPage": false,
-    "allowDownload": false
+    "twoPage": false
   },
   "books": [],
   "titleRules": []

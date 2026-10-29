@@ -17,7 +17,6 @@
 - `config/books.json`: 책 제목, 목차, 표시 여부, 기본 보기 설정
 - `config/설정_간단안내.md`: 설정 예시, 오류별 해결 방법
 - `index.html`, `css/style.css`, `css/native-reader.css`, `js/native-reader.js`: 독자용 최신 뷰어 프로그램
-- `js/reader.js`: 구형 뷰어 코드(현재 HTML에서는 사용하지 않음)
 
 ## 주의할 점
 - **공개 GitHub 저장소의 PDF는 누구나 원본에 접근할 수 있습니다.** 다운로드 버튼을 숨기거나 목차에서 제외해도 파일 자체가 비공개가 되지 않습니다.
@@ -35,3 +34,9 @@
 ## 관련 사이트
 - 실제 운영 중인 책: https://smartbooks1.github.io/AI2027/
 - GitHub Pages 공식 문서: https://docs.github.com/pages
+
+## Viewer sync: 2026-10-30
+
+Synced the current AI2027 reader: mobile resource list, original PDF download, page flip animation and responsive styles. Blank book settings and repository-scoped bookmarks are retained. Book-specific PDFs, covers, store links and practice materials are excluded.
+
+`js/vendor/page-flip.browser.js` and `js/vendor/page-flip.LICENSE` provide the page flip effect and its license. Optional blank-page artwork can be supplied with an `<img data-reader-artwork src="./artwork.png" alt="">` element. No artwork is requested by default.
